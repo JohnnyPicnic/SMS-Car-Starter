@@ -1,0 +1,667 @@
+#define TINY_GSM_MODEM_SIM7600
+#define TINY_GSM_RX_BUFFER          1024 // Set RX buffer to 1Kb
+#define SerialAT                    Serial1
+
+#include <TinyGsmClient.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <Arduino.h>
+#include <driver/adc.h>
+TinyGsm modem(SerialAT);
+
+#define uS_TO_S_FACTOR      1000000ULL  /* Conversion factor for micro seconds to seconds */
+#define TIME_TO_SLEEP       300          /* Time ESP32 will go to sleep (in seconds) */
+#define UART_BAUD           115200
+
+#define MODEM_TX            27
+#define MODEM_RX            26
+#define MODEM_PWRKEY        4
+#define MODEM_DTR           32
+#define MODEM_RI            33
+#define MODEM_FLIGHT        25
+#define MODEM_STATUS        34
+
+#define LED_PIN             12
+#define START_PIN           19   // Define the GPIO pin for START command
+#define UNLOCK_PIN          21   // Define the GPIO pin for UNLOCK command
+#define LOCK_PIN            22   // Define the GPIO pin for LOCK command
+#define BATTERY_ADC_PIN     25   // Define the ADC GPIO pin for battery voltage measurement
+#define VOLTAGE_DIVIDER_RATIO 5.0 // Adjust according to your voltage divider
+
+// --- Globals for delayed SMS ---
+unsigned long smsDelayTimestamp = 0;
+bool smsPending = false;
+String smsRecipient;
+String smsMessage;
+std::vector<String> allowedNumbers;
+
+const String password = "1234"; // Define your password here
+const int maxAllowedNumbers = 10; // Maximum allowed numbers
+// ---------- Helpers ----------
+String readSerialAT(unsigned long timeout = 1500) {
+  String resp;
+  unsigned long start = millis();
+  while (millis() - start < timeout) {
+    while (SerialAT.available()) {
+      resp += (char)SerialAT.read();
+    }
+    delay(5);
+  }
+  return resp;
+}
+void setup() {
+    // Set console baud rate
+    Serial.begin(115200); 
+
+    // Initialize modem
+    SerialAT.begin(UART_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
+    delay(100);
+
+    // Initialize control pins
+    pinMode(START_PIN, OUTPUT);
+    digitalWrite(START_PIN, HIGH); // Ensure the pin is initially off
+
+    pinMode(UNLOCK_PIN, OUTPUT);
+    digitalWrite(UNLOCK_PIN, HIGH); // Ensure the pin is initially off
+
+    pinMode(LOCK_PIN, OUTPUT);
+    digitalWrite(LOCK_PIN, HIGH); // Ensure the pin is initially off
+
+    // Initialize the ADC pin
+    pinMode(BATTERY_ADC_PIN, INPUT);
+
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH);
+
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) {
+        pinMode(MODEM_PWRKEY, OUTPUT);
+        digitalWrite(MODEM_PWRKEY, LOW);
+        delay(100);
+        digitalWrite(MODEM_PWRKEY, HIGH);
+        delay(100);
+        digitalWrite(MODEM_PWRKEY, LOW);
+
+        pinMode(MODEM_FLIGHT, OUTPUT);
+        digitalWrite(MODEM_FLIGHT, HIGH);
+    } else {
+        Serial.println("Wakeup modem !");
+        gpio_hold_dis((gpio_num_t)MODEM_DTR);
+        pinMode(MODEM_DTR, OUTPUT);
+        digitalWrite(MODEM_DTR, LOW);
+        delay(2000);
+        modem.sleepEnable(false);
+    }
+
+    Serial.println("Check modem online .");
+    while (!modem.testAT()) {
+        Serial.print("."); delay(500);
+    }
+    Serial.println("Modem is online !");
+    Serial.println("Setup SMS storage");
+    modem.sendAT("+CNMI=1,2,0,0,0");
+    delay(5000);
+
+    // Initialize SPIFFS
+    if (!SPIFFS.begin(true)) {
+        Serial.println("An error has occurred while mounting SPIFFS");
+        return;
+    }
+    Serial.println("SPIFFS mounted successfully");
+
+    // Load allowed numbers from NVS
+    loadAllowedNumbers();
+}
+void modem_sleep() {
+    Serial.println("Entering modem sleep mode...");
+
+    // Ensure modem is awake before sending sleep command
+    gpio_hold_dis((gpio_num_t)MODEM_DTR);
+    pinMode(MODEM_DTR, OUTPUT);
+    digitalWrite(MODEM_DTR, LOW);  // Pull DTR low briefly to wake modem
+    delay(500);
+
+    // Pull DTR high to request sleep
+    digitalWrite(MODEM_DTR, HIGH);
+    delay(100);
+
+    // Hold DTR across ESP32 deep sleep
+    gpio_hold_en((gpio_num_t)MODEM_DTR);
+    gpio_deep_sleep_hold_en();
+
+    // Tell the modem to enter sleep mode
+    if (!modem.sleepEnable(true)) {
+        Serial.println("Modem sleep command failed!");
+        return;
+    }
+
+    Serial.println("Modem sleep command sent, checking sleep status...");
+
+    // Wait briefly and check sleep status
+    delay(500);
+    String resp = readSerialAT(1000); // Read any pending responses
+    if (resp.indexOf("OK") != -1) {
+        Serial.println("Modem acknowledged sleep command.");
+    } else {
+        Serial.println("Warning: Modem may not have entered sleep.");
+    }
+
+    // Optional: measure current draw to confirm sleep
+    Serial.println("Modem should now be in low-power sleep mode.");
+}
+
+void modem_wakeup (){
+          Serial.println("Wakeup modem !");
+
+        // Need to cancel GPIO hold if wake from sleep
+        gpio_hold_dis((gpio_num_t )MODEM_DTR);
+
+        // Pull down DTR to wake up MODEM
+        pinMode(MODEM_DTR, OUTPUT);
+        digitalWrite(MODEM_DTR, LOW);
+        delay(2000);
+        modem.sleepEnable(false);
+
+        
+}
+esp_sleep_wakeup_cause_t wakeup_reason;
+void print_wakeup_reason(){
+ 
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+ 
+  // Print if if it was a GPIO or something else
+  switch(wakeup_reason)
+  {
+    case ESP_SLEEP_WAKEUP_EXT0 : Serial.println("Wakeup caused by external signal using RTC_IO"); break;
+    case ESP_SLEEP_WAKEUP_EXT1 : Serial.println("Wakeup caused by external signal using RTC_CNTL"); break;
+    case ESP_SLEEP_WAKEUP_TIMER : Serial.println("Wakeup caused by timer"); break;
+    case ESP_SLEEP_WAKEUP_TOUCHPAD : Serial.println("Wakeup caused by touchpad"); break;
+    case ESP_SLEEP_WAKEUP_ULP : Serial.println("Wakeup caused by ULP program"); break;
+    default : Serial.printf("Wakeup was not caused by deep sleep: %d\n",wakeup_reason); break;
+  }
+}
+// Function to check network registration
+void checkAndReconnectNetwork() {
+  // Check if the modem is already connected to the network
+  if (!modem.isNetworkConnected()) {
+    Serial.println("Network not connected. Attempting to reconnect...");
+    
+    // Wait for the modem to register on the network
+    if (modem.waitForNetwork()) {
+      Serial.println("Successfully connected to the network.");
+    } else {
+      Serial.println("Failed to connect to the network.");
+      // Handle failure (e.g., retry, send error notification, etc.)
+      // Optionally, you can add a retry mechanism here.
+    }
+  } else {
+    Serial.println("Already connected to the network.");
+  }
+}
+void checkSMS() {
+    String smsContent = "";
+    unsigned long timeout = millis() + 1000; // Set timeout for 1 second
+    bool cmtDetected = false;
+
+    // Clear serial buffer
+    while (SerialAT.available()) {
+        SerialAT.read();
+    }
+
+    // Read SMS
+    while (millis() < timeout) {
+        if (SerialAT.available()) {
+            char c = (char)SerialAT.read();
+            smsContent += c;
+
+            if (smsContent.indexOf("+CMT:") != -1) {
+                cmtDetected = true;
+            }
+            if (cmtDetected && smsContent.endsWith("\r\n\r\n")) {
+                break;
+            }
+        }
+        delay(10);
+    }
+
+    Serial.println("Received SMS:");
+    Serial.println(smsContent);
+ 
+    // Extract sender number
+    int startIdx = smsContent.indexOf("+CMT: \"") + 7;
+    int endIdx = smsContent.indexOf("\"", startIdx);
+    String sender = smsContent.substring(startIdx, endIdx);
+    Serial.println("Sender: " + sender);
+    //Send Help
+    if (smsContent.indexOf("HELP") != -1) {
+    handleHelpCommand(sender);
+    return; // Don't process further
+    }
+    // Process number management commands before checking authorization
+    handleNumberManagement(smsContent);
+
+    if (!isAllowedNumber(sender)) {
+        Serial.println("Unauthorized sender. Ignoring SMS.");
+        return;
+    }
+
+    // Process valid SMS
+    Serial.println("Authorized SMS detected. Processing...");
+    handleFlashLEDCommand(smsContent);
+    handleSMSCommand(smsContent, sender);
+
+    // Check for list numbers command
+    if (smsContent.indexOf("LIST NUMBERS") != -1) {
+        sendAllowedNumbersList(sender);
+    }
+
+    // Check for temperature command
+    if (smsContent.indexOf("CHECK TEMP") != -1) {
+        handleCheckTempCommand(sender);
+    }
+}
+void handleNumberManagement(const String& smsContent) {
+    if (smsContent.indexOf(password) == -1) {
+        Serial.println("Invalid or missing password. Ignoring command.");
+        return;
+    }
+
+    if (smsContent.indexOf("ADD NUMBER") != -1) {
+        if (allowedNumbers.size() >= maxAllowedNumbers) {
+            Serial.println("Cannot add number. Maximum limit reached.");
+            return;
+        }
+        int startIdx = smsContent.indexOf("ADD NUMBER") + 11;
+        String numberToAdd = smsContent.substring(startIdx);
+        numberToAdd.trim();
+        allowedNumbers.push_back(numberToAdd);
+        saveAllowedNumbers();
+        Serial.println("Added number: " + numberToAdd);
+    } else if (smsContent.indexOf("REMOVE NUMBER") != -1) {
+        int startIdx = smsContent.indexOf("REMOVE NUMBER") + 14;
+        String numberToRemove = smsContent.substring(startIdx);
+        numberToRemove.trim();
+        auto it = std::find(allowedNumbers.begin(), allowedNumbers.end(), numberToRemove);
+        if (it != allowedNumbers.end()) {
+            allowedNumbers.erase(it);
+            saveAllowedNumbers();
+            Serial.println("Removed number: " + numberToRemove);
+        } else {
+            Serial.println("Number not found: " + numberToRemove);
+        }
+    }
+}
+void handleHelpCommand(const String& sender) {
+    String helpMessage =
+        "Car SMS Commands:\n"
+        "1. ADD NUMBER <password> <number>\n"
+        "2. REMOVE NUMBER <password> <number>\n"
+        "3. LIST NUMBERS\n"
+        "4. START\n"
+        "5. START? - Start + battery status\n"
+        "6. LOCK\n"
+        "7. UNLOCK\n"
+        "8. BATTERY?\n"
+        "9. CHECK TEMP\n"
+        "10. FLASH LED <n>\n"
+        "Use password for add/remove commands.";
+
+    sendSMS(sender, helpMessage);
+    Serial.println("Sent HELP message to: " + sender);
+}
+bool isAllowedNumber(const String& sender) {
+    for (const auto& number : allowedNumbers) {
+        if (sender.indexOf(number) != -1) {
+            return true;
+        }
+    }
+    return false;
+}
+void loadAllowedNumbers() {
+    File file = SPIFFS.open("/allowed_numbers.txt", "r");
+    if (!file) {
+        Serial.println("Failed to open file for reading");
+        return;
+    }
+
+    allowedNumbers.clear();
+    while (file.available()) {
+        String number = file.readStringUntil('\n');
+        number.trim();
+        if (number.length() > 0) {
+            allowedNumbers.push_back(number);
+        }
+    }
+    file.close();
+
+    Serial.println("Loaded allowed numbers from SPIFFS:");
+    for (const auto& number : allowedNumbers) {
+        Serial.println(number);
+    }
+}
+void saveAllowedNumbers() {
+    File file = SPIFFS.open("/allowed_numbers.txt", "w");
+    if (!file) {
+        Serial.println("Failed to open file for writing");
+        return;
+    }
+
+    for (const auto& number : allowedNumbers) {
+        file.println(number);
+    }
+    file.close();
+
+    Serial.println("Saved allowed numbers to SPIFFS.");
+}
+void loop() {
+ 
+    print_wakeup_reason();
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0){
+      Serial.printf("Check SMS messages\r\n");
+      checkSMS();
+    }
+    else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER){
+      Serial.printf("Check if modem is registered\r\n");
+      modem_wakeup();
+      checkAndReconnectNetwork();
+      modem_sleep();
+    };
+
+    digitalWrite(LED_PIN, LOW); // Turn LED off
+    
+    Serial.println("Enter esp32 sleep!");
+    esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+    esp_sleep_enable_gpio_wakeup();
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_33, 0);
+
+    delay(200);
+    // Feed the watchdog
+    // esp_task_wdt_reset();
+
+    esp_light_sleep_start();
+
+}
+// Function to read the response from the SIM7600
+String readResponse(unsigned long timeout) {
+  String response = "";
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < timeout) {
+    while (SerialAT.available()) {
+      char c = SerialAT.read();
+      response += c;
+    }
+  }
+
+  return response;
+}
+// Function to delete all SMS messages
+void deleteAllSMS() {
+  modem.sendAT("+CMGD=1,4");  // Command to delete all SMS (1 is the starting index, 4 means delete all)
+  delay(1000);  // Wait for the modem to process the command
+
+  String response = "";
+  while (SerialAT.available()) {
+    response += (char)SerialAT.read();  // Read the response from the modem
+  }
+
+  // Print the response from the modem
+  Serial.println("Delete all SMS response: " + response);
+}
+// Function to handle Flash LED command and flash the LED
+void handleFlashLEDCommand(String smsContent) {
+    // Check if the SMS contains the "Flash LED" command
+    int flashPos = smsContent.indexOf("Flash LED");
+
+    if (flashPos != -1) {  // Only proceed if "Flash LED" is found
+        int numberPos = flashPos + 9;  // Skip past "Flash LED" (9 characters)
+        
+        // Ensure that numberPos is within the bounds of the string
+        if (numberPos < smsContent.length()) {
+            // Extract the substring after "Flash LED" and trim any whitespace
+            String numStr = smsContent.substring(numberPos);
+            numStr.trim();  // Trim any leading or trailing whitespace
+            
+            // Debug print to check extracted number string
+            Serial.println("Extracted number: " + numStr);
+            
+            // Convert the extracted string to an integer
+            int flashCount = numStr.toInt();
+
+            // If the number is valid (greater than 0), flash the LED
+            if (flashCount > 0) {
+                flashLED(flashCount);  // Call the flashLED function to flash the LED
+            } else {
+                Serial.println("Invalid flash count in message.");
+            }
+        } else {
+            Serial.println("Error: Number position is out of bounds.");
+        }
+    } else {
+        Serial.println("No 'Flash LED' command found in the SMS.");
+    }
+}
+// Function to flash the LED the specified number of times
+void flashLED(int count) {
+    for (int i = 0; i < count; i++) {
+        digitalWrite(LED_PIN, HIGH); // Turn LED on
+        delay(150); // Wait for 500ms
+        digitalWrite(LED_PIN, LOW); // Turn LED off
+        delay(150); // Wait for 500ms before flashing again
+    }
+    Serial.print("Flashed the LED ");
+    Serial.print(count);
+    Serial.println(" times.");
+}
+// Function to handle incoming SMS commands
+void handleSMSCommand(const String& smsContent, const String& sender) {
+    // Convert the received SMS content to lowercase for case-insensitivity
+    String command = toLowerCase(smsContent);
+
+    if (command.indexOf("start?") != -1) {
+        // Start the car by toggling the relay
+        digitalWrite(START_PIN, LOW);
+        Serial.println("Start? Received. START_PIN set to LOW.");
+        delay(500);
+        digitalWrite(START_PIN, HIGH);
+        Serial.println("START_PIN set to HIGH.");
+
+        // Wait 10 seconds before checking the voltage
+        Serial.println("Waiting 10 seconds...");
+        delay(8000);
+
+        // Measure the battery voltage
+        float batteryVoltage = measureBatteryVoltage();
+        Serial.println("Measured Battery Voltage: " + String(batteryVoltage, 2) + "V");
+
+        // Send an SMS reply with the car status and battery voltage
+        String message;
+        if (batteryVoltage > 12.9) {
+            message = "Car Started. Battery Voltage: " + String(batteryVoltage, 2) + "V";
+        } else {
+            message = "Car Not Started. Battery Voltage: " + String(batteryVoltage, 2) + "V";
+        }
+        sendSMS(sender, message); 
+    } 
+    else if (command.indexOf("start") != -1) {
+        // Immediately start the car by toggling the relay
+        digitalWrite(START_PIN, LOW);
+        Serial.println("START_PIN set to LOW.");
+        delay(500);
+        digitalWrite(START_PIN, HIGH);
+        Serial.println("START_PIN set to HIGH.");
+    } 
+    else if (command.indexOf("battery?") != -1) {
+        // Measure the battery voltage
+        float batteryVoltage = measureBatteryVoltage();
+        Serial.println("Measured Battery Voltage: " + String(batteryVoltage, 2) + "V");
+
+        // Send an SMS reply with the battery voltage
+        String message = "Battery Voltage: " + String(batteryVoltage, 2) + "V";
+        sendSMS(sender, message); 
+    } 
+    else if (command.indexOf("unlock") != -1) {
+        // Unlock the car
+        digitalWrite(UNLOCK_PIN, LOW);
+        Serial.println("UNLOCK_PIN set to LOW.");
+        delay(500);
+        digitalWrite(UNLOCK_PIN, HIGH);
+        Serial.println("UNLOCK_PIN set to HIGH.");
+    }
+    else if (command.indexOf("lock") != -1) {
+        // Lock the car
+        digitalWrite(LOCK_PIN, LOW);
+        Serial.println("LOCK_PIN set to LOW.");
+        delay(500);
+        digitalWrite(LOCK_PIN, HIGH);
+        Serial.println("LOCK_PIN set to HIGH.");
+    }
+}
+void sendAllowedNumbersList(const String& sender) {
+    String message = "Allowed numbers:\n";
+    for (const auto& number : allowedNumbers) {
+        message += number + "\n";
+    }
+    sendSMS(sender, message);
+}
+// --- Updated sendSMS that handles long messages ---
+void sendSMS(const String& number, const String& message) {
+    const int SMS_MAX = 160; // Max chars per SMS
+    int start = 0;
+
+    while (start < message.length()) {
+        int end = start + SMS_MAX;
+        if (end > message.length()) end = message.length();
+
+        String chunk = message.substring(start, end);
+        chunk.trim();
+
+        // Wake modem if sleeping
+        modem_wakeup();
+
+        // Send chunk
+        modem.sendAT("+CMGS=\"" + number + "\"");
+        delay(100);
+        modem.stream.write(chunk.c_str());
+        delay(100);
+        modem.stream.write((char)26); // CTRL+Z
+        delay(1000); // Let modem process
+
+        Serial.println("Sent SMS to " + number + ": " + chunk);
+
+        start = end;
+        delay(500); // Short pause between messages
+    }
+
+    modem_sleep();
+}
+
+void handleCheckTempCommand(const String& sender) {
+    float temperature = readTemperature();
+    String message = "Board Temperature: " + String(temperature);
+    sendSMS(sender, message);
+    Serial.println("Sent temperature SMS to " + sender + ": " + message);
+}
+// Function to measure battery voltage
+float measureBatteryVoltage() {
+  // configure ADC attenuation for full-range reading of higher voltages
+  // ADC attenuation options: ADC_0db, ADC_2_5db, ADC_6db, ADC_11db
+  // Using 11db extends measurable voltage to ~3.6V on ADC pin
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+
+  int raw = analogRead(BATTERY_ADC_PIN); // 0..4095
+  if (raw < 0) raw = 0;
+  if (raw > 4095) raw = 4095;
+
+  // convert to voltage (assuming ADC reference ~3.3)
+  float v_adc = (raw / 4095.0) * 3.3;
+  float batteryV = v_adc * VOLTAGE_DIVIDER_RATIO;
+  return batteryV;
+}
+float readTemperature() {
+    float tempFahrenheit = temperatureRead();
+    float tempCelsius = (tempFahrenheit - 32) * 5.0 / 9.0;
+    return tempCelsius;
+}
+// Function to convert a string to lowercase
+String toLowerCase(String str) {
+    str.toLowerCase();
+    return str;
+}
+
+// Wait for a substring in the response until timeout (ms)
+bool waitForATResponse(const String& expect, unsigned long timeout = 1500) {
+  unsigned long start = millis();
+  String acc;
+  while (millis() - start < timeout) {
+    while (SerialAT.available()) {
+      acc += (char)SerialAT.read();
+      if (acc.indexOf(expect) != -1) return true;
+    }
+    delay(5);
+  }
+  return false;
+}
+
+// Normalizes incoming "sender" string if it appears inside quotes
+String extractQuoted(const String& s) {
+  int a = s.indexOf('"');
+  if (a == -1) return s;
+  int b = s.indexOf('"', a + 1);
+  if (b == -1) return s.substring(a + 1);
+  return s.substring(a + 1, b);
+}
+
+// ---------- Modem health / reset ----------
+void pulseModemPwrKey() {
+  // Typical SIM7600 PWRKEY toggle: pull low for ~100-500ms (depends on board)
+  pinMode(MODEM_PWRKEY, OUTPUT);
+  digitalWrite(MODEM_PWRKEY, LOW);
+  delay(300);
+  digitalWrite(MODEM_PWRKEY, HIGH);
+  delay(300);
+  digitalWrite(MODEM_PWRKEY, LOW);
+  delay(1000); // let modem settle / boot
+}
+
+void ensureModemAlive() {
+  Serial.println("ensureModemAlive: checking modem with AT...");
+  // quick AT check
+  SerialAT.flush();
+  SerialAT.print("AT\r\n");
+  if (waitForATResponse("OK", 1500)) {
+    Serial.println("Modem responded to AT.");
+    return;
+  }
+
+  Serial.println("No AT response. Trying gentle wake via DTR...");
+  // Try toggling DTR first (wakeup)
+  gpio_hold_dis((gpio_num_t)MODEM_DTR);
+  pinMode(MODEM_DTR, OUTPUT);
+  digitalWrite(MODEM_DTR, LOW);
+  delay(2000);
+
+  SerialAT.print("AT\r\n");
+  if (waitForATResponse("OK", 1500)) {
+    Serial.println("Woke modem via DTR.");
+    return;
+  }
+
+  Serial.println("Still no response. Power-cycling modem via PWRKEY...");
+  // Try hardware power-cycle
+  // Optionally toggle FLIGHT low/high depending on board wiring
+  pinMode(MODEM_FLIGHT, OUTPUT);
+  digitalWrite(MODEM_FLIGHT, LOW); // ensure not in flight (if active)
+  delay(100);
+
+  pulseModemPwrKey();
+
+  // Wait and test
+  delay(3000);
+  SerialAT.print("AT\r\n");
+  if (waitForATResponse("OK", 3000)) {
+    Serial.println("Modem alive after power-cycle.");
+  } else {
+    Serial.println("Modem still not responding after power-cycle.");
+  }
+}
+
